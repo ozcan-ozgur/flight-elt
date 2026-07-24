@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: dim_airline
+    description: "One row per airline ICAO code."
+    columns:
+      - name: icao_code
+        description: "Airline ICAO code — the join key to flights."
+        data_tests:
+          - not_null
+          - unique
+
+  - name: fct_flight_positions
+    description: "Flight state vectors enriched with airline attributes."
+    columns:
+      - name: flight_state_id
+        description: "Grain: one row per raw flight state observation."
+        data_tests:
+          - not_null
+          - unique
+      - name: airline_icao
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('dim_airline')
+                field: icao_code
