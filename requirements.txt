@@ -4,3 +4,10 @@ numpy
 sqlalchemy
 psycopg2-binary
 python-dotenv
+dbt-core
+dbt-postgres
+dagster
+dagster-webserver
+dagster-dbt
+dagster-postgres
+streamlit

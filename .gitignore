@@ -7,3 +7,11 @@ __pycache__/
 target/
 dbt_packages/
 logs/
+
+# dagster
+.dagster_home/
+.tmp_dagster_home_*/
+
+# per-machine, not per-project
+.claude/settings.local.json
+flight_dbt/.user.yml

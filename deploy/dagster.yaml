@@ -1,0 +1,17 @@
+# Dagster stores runs, event logs and schedule state in Postgres so that the
+# webserver and daemon containers share one source of truth. SQLite (the
+# default) cannot be written by two containers at once.
+storage:
+  postgres:
+    postgres_db:
+      username:
+        env: DB_USER
+      password:
+        env: DB_PASSWORD
+      hostname:
+        env: DB_HOST
+      db_name: dagster
+      port: 5432
+
+telemetry:
+  enabled: false

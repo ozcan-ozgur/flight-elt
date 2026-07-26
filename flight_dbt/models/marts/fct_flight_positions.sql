@@ -1,3 +1,16 @@
+{{
+    config(
+        indexes=[{'columns': ['snapshot_at']}]
+    )
+}}
+
+{#
+    Every dashboard query either filters on a single snapshot or groups by it,
+    so this is the one column worth indexing. It belongs in config rather than a
+    hand-run CREATE INDEX because the model is materialised as a table: each run
+    drops and rebuilds it, and anything created on the side disappears with it.
+#}
+
 with flights as (
 
     select * from {{ ref('stg_flight_states') }}

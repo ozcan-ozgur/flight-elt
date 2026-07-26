@@ -1,7 +1,36 @@
+x-dagster-common: &dagster-common
+  build: .
+  # Listed explicitly rather than via env_file: the host .env also carries a
+  # Windows DAGSTER_HOME path that must not leak into the containers.
+  environment:
+    DB_USER: ${DB_USER}
+    DB_PASSWORD: ${DB_PASSWORD}
+    DB_NAME: ${DB_NAME}
+    # Inside the compose network the database is reached by service name.
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DAGSTER_HOME: /opt/dagster_home
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
 services:
   postgres:
     image: postgres:16
     container_name: flight-db
+    # Two guardrails against a lock convoy. A client that leaks an open read
+    # transaction pins ACCESS SHARE on the fact table; dbt's rebuild then parks
+    # behind it waiting for ACCESS EXCLUSIVE, and because the lock queue is
+    # FIFO every later query — dashboard and Dagster alike — queues behind dbt.
+    # The first setting reaps the leaked session, the second keeps any waiter
+    # from becoming the head of such a queue.
+    command:
+      - postgres
+      - -c
+      - idle_in_transaction_session_timeout=60s
+      - -c
+      - lock_timeout=30s
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
@@ -10,6 +39,24 @@ services:
       - "5434:5432"
     volumes:
       - flight_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dagster-webserver:
+    <<: *dagster-common
+    container_name: flight-dagster-webserver
+    command: dagster-webserver -h 0.0.0.0 -p 3000 -w workspace.yaml
+    ports:
+      - "3000:3000"
+
+  # Runs schedules and sensors. Without it nothing fires on its own.
+  dagster-daemon:
+    <<: *dagster-common
+    container_name: flight-dagster-daemon
+    command: dagster-daemon run -w workspace.yaml
 
 volumes:
   flight_pgdata:

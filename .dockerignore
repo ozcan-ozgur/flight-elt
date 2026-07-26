@@ -1,0 +1,15 @@
+# Secrets must never be baked into the image — Dagster also auto-loads any
+# .env it finds in the working directory, which would override container env.
+.env
+
+.venv/
+.idea/
+.git/
+.dagster_home/
+.tmp_dagster_home_*/
+__pycache__/
+*.pyc
+flight_dbt/target/
+flight_dbt/logs/
+flight_dbt/dbt_packages/
+docs/

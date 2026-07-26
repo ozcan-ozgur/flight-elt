@@ -1,0 +1,14 @@
+# Connection details come from the environment so the same project works on the
+# host (localhost:5434) and inside Docker (postgres:5432).
+flight_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DB_HOST', 'localhost') }}"
+      port: "{{ env_var('DB_PORT', '5434') | int }}"
+      user: "{{ env_var('DB_USER') }}"
+      pass: "{{ env_var('DB_PASSWORD') }}"
+      dbname: "{{ env_var('DB_NAME') }}"
+      schema: public
+      threads: 4
