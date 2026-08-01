@@ -20,6 +20,10 @@ conn = st.connection("sql", url=DB_URL, pool_pre_ping=True, pool_recycle=300)
 
 # Instrument-panel palette, shared with the seismic-monitor project.
 AMBER = "#f0883e"
+
+# A day below this share of its 48 expected snapshots is reported, but flagged,
+# and never used as the baseline for a day-on-day comparison.
+FULL_DAY_COVERAGE = 70
 MUTED = "#6e7681"
 
 # Sequential low → high, taken from the seismic magnitude scale.
@@ -140,18 +144,40 @@ US_AIRLINES = [
     "JetBlue Airways",
 ]
 
-def trend_chart(data: pd.DataFrame, field: str, legend: str, domain: list[str]) -> alt.Chart:
-    """Aircraft-over-time line per category, colored from the fixed palette."""
+def trend_chart(
+    data: pd.DataFrame,
+    field: str,
+    legend: str,
+    domain: list[str],
+    y_max: float | None = None,
+    compact: bool = False,
+) -> alt.Chart:
+    """Aircraft-over-time line per category, colored from the fixed palette.
+
+    `y_max` pins the axis so two of these can be read against each other: side by
+    side on their own scales, a 399-aircraft peak would be drawn exactly as tall
+    as a 484-aircraft one. `compact` moves the legend under the plot, where a
+    half-width panel has room to spare, instead of beside it where it does not.
+    """
     return (
         alt.Chart(data)
-        .mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=64, filled=True))
+        .mark_line(strokeWidth=2)
         .encode(
             x=alt.X("snapshot_at:T", title="Snapshot"),
-            y=alt.Y("aircraft:Q", title="Aircraft airborne"),
+            y=alt.Y(
+                "aircraft:Q",
+                title="Aircraft airborne",
+                scale=alt.Scale(domain=(0, y_max)) if y_max else alt.Undefined,
+            ),
             color=alt.Color(
                 f"{field}:N",
                 title=legend,
                 scale=alt.Scale(domain=domain, range=TREND_COLORS[: len(domain)]),
+                legend=(
+                    alt.Legend(orient="bottom", direction="vertical", columns=2, labelLimit=170)
+                    if compact
+                    else alt.Undefined
+                ),
             ),
             tooltip=[
                 alt.Tooltip("snapshot_at:T", title="Snapshot", format="%d %b, %H:%M"),
@@ -321,6 +347,14 @@ snapshot_stats = conn.query(
     group by snapshot_at
     order by snapshot_at
     """,
+    ttl="5m",
+)
+
+# Already one row per day out of dbt, so this is a read rather than an
+# aggregation — the reasoning about which daily figures survive the sampling
+# lives in the model, not here.
+daily_traffic = conn.query(
+    "select * from fct_daily_traffic order by traffic_date desc",
     ttl="5m",
 )
 
@@ -588,10 +622,21 @@ with left.container(border=True, height="stretch"):
     else:
         chart = (
             alt.Chart(top_airlines)
-            .mark_bar(cornerRadiusEnd=3, color=AMBER)
+            .mark_bar(cornerRadiusEnd=3)
             .encode(
                 x=alt.X("aircraft:Q", title="Aircraft"),
                 y=alt.Y("airline:N", title=None, sort="-x"),
+                # Shares the altitude/envelope ramp so the page reads as one warm
+                # scale. It does restate what the bar length already says —
+                # colour here carries no information of its own — so no legend:
+                # a key would put the same number on screen a third time.
+                # Linear, not log like the envelope; twelve bars are not the
+                # skewed distribution that needed compressing there.
+                color=alt.Color(
+                    "aircraft:Q",
+                    scale=alt.Scale(range=ENVELOPE_RAMP),
+                    legend=None,
+                ),
                 tooltip=["airline", "aircraft"],
             )
             .properties(height=380)
@@ -688,14 +733,23 @@ with st.container(border=True):
     st.caption("Airborne aircraft per snapshot, across the whole dataset")
     # Reuses snapshot_stats rather than asking for the same figure again: the
     # airborne count per snapshot is already the first column of that result.
-    st.line_chart(
-        snapshot_stats,
-        x="snapshot_at",
-        y="airborne",
-        x_label="Snapshot",
-        y_label="Aircraft airborne",
-        color=AMBER,
-        height=220,
+    #
+    # Altair rather than st.line_chart, which draws a marker on every reading —
+    # 94 of them here — and is the only line chart on the page not going through
+    # trend_chart. One series, so the subheader names it and no legend is needed.
+    st.altair_chart(
+        alt.Chart(snapshot_stats)
+        .mark_line(strokeWidth=2, color=AMBER)
+        .encode(
+            x=alt.X("snapshot_at:T", title="Snapshot"),
+            y=alt.Y("airborne:Q", title="Aircraft airborne"),
+            tooltip=[
+                alt.Tooltip("snapshot_at:T", title="Snapshot", format="%d %b, %H:%M"),
+                alt.Tooltip("airborne:Q", title="Aircraft airborne", format=",d"),
+            ],
+        )
+        .properties(height=220),
+        width="stretch",
     )
 
 with st.container(border=True):
@@ -709,26 +763,150 @@ with st.container(border=True):
         width="stretch",
     )
 
-with st.container(border=True):
-    st.subheader("European traffic over time")
-    st.caption("Airborne aircraft per carrier, across the whole dataset · a fixed set of eight")
-    if eu_airline_trend.empty:
-        st.caption("No tracking data for these carriers yet.")
-    else:
-        st.altair_chart(
-            trend_chart(eu_airline_trend, "airline_name", "Airline", EU_AIRLINES),
-            width="stretch",
-        )
+# Side by side and on one shared axis, so the two continents can be read against
+# each other — the whole point of showing them at all. The ceiling comes from
+# both frames together; on separate scales Europe's 399-aircraft peak would be
+# drawn as tall as America's 484 and the panels would quietly lie.
+fleet_ceiling = max(
+    eu_airline_trend["aircraft"].max() if not eu_airline_trend.empty else 0,
+    us_airline_trend["aircraft"].max() if not us_airline_trend.empty else 0,
+)
+
+europe, americas = st.columns(2)
+
+for column, title, data, carriers in (
+    (europe, "European traffic over time", eu_airline_trend, EU_AIRLINES),
+    (americas, "American traffic over time", us_airline_trend, US_AIRLINES),
+):
+    with column.container(border=True, height="stretch"):
+        st.subheader(title)
+        st.caption("Airborne aircraft per carrier · a fixed set of eight, shared scale")
+        if data.empty:
+            st.caption("No tracking data for these carriers yet.")
+        else:
+            st.altair_chart(
+                trend_chart(
+                    data,
+                    "airline_name",
+                    "Airline",
+                    carriers,
+                    y_max=fleet_ceiling,
+                    compact=True,
+                ),
+                width="stretch",
+            )
 
 with st.container(border=True):
-    st.subheader("American traffic over time")
-    st.caption("Airborne aircraft per carrier, across the whole dataset · a fixed set of eight")
-    if us_airline_trend.empty:
-        st.caption("No tracking data for these carriers yet.")
+    st.subheader("Day in review")
+    st.caption(
+        "One row per UTC day · coverage is the share of the 48 expected snapshots "
+        "that landed, and a thin day undercounts its own peak"
+    )
+    if daily_traffic.empty:
+        st.caption("No completed days yet.")
     else:
-        st.altair_chart(
-            trend_chart(us_airline_trend, "airline_name", "Airline", US_AIRLINES),
+        day_labels = {
+            row.traffic_date: (
+                f"{row.traffic_date:%d %b %Y}"
+                + ("" if row.coverage_pct >= FULL_DAY_COVERAGE else f"  ·  {row.coverage_pct:.0f}% coverage")
+            )
+            for row in daily_traffic.itertuples()
+        }
+        chosen = st.selectbox(
+            "Day",
+            list(day_labels),
+            format_func=day_labels.get,
+            label_visibility="collapsed",
+        )
+        day = daily_traffic.set_index("traffic_date").loc[chosen]
+
+        # Day-on-day only against a day complete enough to have found its own
+        # peak; comparing against a 17%-coverage day would read as a crash in
+        # traffic that is really just a gap in sampling.
+        earlier = daily_traffic[daily_traffic["traffic_date"] < chosen]
+        earlier = earlier[earlier["coverage_pct"] >= FULL_DAY_COVERAGE]
+        previous = earlier.iloc[0] if not earlier.empty else None
+
+        if day.coverage_pct < FULL_DAY_COVERAGE:
+            st.warning(
+                f"Only {day.snapshots} of 48 snapshots landed on this day "
+                f"({day.coverage_pct:.0f}%). Peak and trough are floors, not the real extremes.",
+                icon=":material/warning:",
+            )
+
+        with st.container(horizontal=True):
+            st.metric(
+                "Peak airborne",
+                f"{day.peak_airborne:,}",
+                delta=(
+                    f"{day.peak_airborne / previous.peak_airborne - 1:+.0%} vs {previous.traffic_date:%d %b}"
+                    if previous is not None
+                    else None
+                ),
+                border=True,
+                help=f"Reached at {day.peak_at:%H:%M} UTC.",
+            )
+            st.metric(
+                "Quietest moment",
+                f"{day.trough_airborne:,}",
+                delta=f"at {day.trough_at:%H:%M} UTC",
+                delta_arrow="off",
+                delta_color="off",
+                border=True,
+            )
+            st.metric(
+                "Busiest airline",
+                day.busiest_airline or "—",
+                delta=(
+                    f"{day.busiest_airline_aircraft:,.0f} aircraft on average"
+                    if pd.notna(day.busiest_airline_aircraft)
+                    else None
+                ),
+                delta_arrow="off",
+                delta_color="off",
+                border=True,
+                help="Ranked on the mean across the day's snapshots, not the daily total.",
+            )
+            st.metric(
+                "Typical cruise",
+                f"{day.median_altitude:,.0f} m",
+                delta=f"{day.median_velocity:.0f} m/s",
+                delta_arrow="off",
+                delta_color="off",
+                border=True,
+                help="Median across every airborne reading that day.",
+            )
+
+        st.dataframe(
+            daily_traffic,
+            hide_index=True,
             width="stretch",
+            column_order=[
+                "traffic_date",
+                "coverage_pct",
+                "peak_airborne",
+                "trough_airborne",
+                "mean_airborne",
+                "busiest_airline",
+                "median_altitude",
+                "climb_ratio",
+            ],
+            column_config={
+                "traffic_date": st.column_config.DateColumn("Day", format="DD MMM YYYY"),
+                "coverage_pct": st.column_config.ProgressColumn(
+                    "Coverage", min_value=0, max_value=100, format="%d%%"
+                ),
+                "peak_airborne": st.column_config.NumberColumn("Peak", format="localized"),
+                "trough_airborne": st.column_config.NumberColumn("Quietest", format="localized"),
+                "mean_airborne": st.column_config.NumberColumn("Average", format="localized"),
+                "busiest_airline": st.column_config.TextColumn("Busiest airline"),
+                "median_altitude": st.column_config.NumberColumn("Median altitude", format="%d m"),
+                "climb_ratio": st.column_config.NumberColumn(
+                    "Climb : descend",
+                    format="%.2f",
+                    help="Above 1 the sky filled over the day, below 1 it drained.",
+                ),
+            },
         )
 
 with st.container(border=True):
