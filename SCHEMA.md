@@ -1,38 +1,38 @@
-# Flight ELT — Veritabani Semasi
+# Flight ELT — Database Schema
 
-OpenSky Network API'den ucak konum verisi cekip Postgres'e yazan, dbt ile
-staging/marts katmanlarina donusturen bir ELT pipeline'i. Bu dosya Metabase
-uzerinde sorgu yazarken (veya baska bir araca baglam vermek icin) tum
-tablo/kolon yapisini tek yerde ozetler.
+An ELT pipeline that pulls aircraft position data from the OpenSky Network API
+into Postgres and transforms it through dbt staging/marts layers. This file
+summarises the full table/column structure in one place — useful when writing
+queries in Metabase (or when giving another tool context about the model).
 
-Katman akisi: `raw_flight_states` (ham, elt.py yazar) + `airlines` seed →
-`stg_flight_states` / `stg_airlines` (staging, tipleme+temizlik) →
-`dim_airline` / `fct_flight_positions` / `fct_daily_traffic` (marts, BI icin
-kullanilacak son tablolar). Materialization: staging = view, marts = table
-(bkz. `flight_dbt/dbt_project.yml`).
+Layer flow: `raw_flight_states` (raw, written by `elt.py`) + `airlines` seed →
+`stg_flight_states` / `stg_airlines` (staging, typing + cleaning) →
+`dim_airline` / `fct_flight_positions` / `fct_daily_traffic` (marts, the final
+tables used for BI). Materialization: staging = view, marts = table
+(see `flight_dbt/dbt_project.yml`).
 
 ---
 
-## 1. `raw_flight_states` (ham tablo, Postgres `public` semasi)
+## 1. `raw_flight_states` (raw table, Postgres `public` schema)
 
-`elt.py` tarafindan OpenSky `/api/states/all` cevabindan doldurulur, dbt
-disinda yonetilir (`_sources.yml` icinde `source('raw','raw_flight_states')`
-olarak referans alinir).
+Populated by `elt.py` from the OpenSky `/api/states/all` response. Managed
+outside dbt (referenced as `source('raw','raw_flight_states')` in
+`_sources.yml`).
 
-| Kolon | Tip | Aciklama |
+| Column | Type | Description |
 |---|---|---|
 | id | SERIAL PK | |
-| query_time | BIGINT | API cagrisinin epoch zamani (snapshot_at'e donusur) |
-| icao24 | TEXT | Ucak transponder adresi |
-| callsign | TEXT | Ham cagri isareti (bosluklu/bos gelebilir) |
-| origin_country | TEXT | Kayitli ulke |
-| time_position | BIGINT | Pozisyon epoch zamani |
-| last_contact | BIGINT | Son temas epoch zamani |
+| query_time | BIGINT | Epoch time of the API call (becomes snapshot_at) |
+| icao24 | TEXT | Aircraft transponder address |
+| callsign | TEXT | Raw callsign (may be padded/empty) |
+| origin_country | TEXT | Registered country |
+| time_position | BIGINT | Position epoch time |
+| last_contact | BIGINT | Last-contact epoch time |
 | longitude, latitude | DOUBLE PRECISION | |
-| baro_altitude, geo_altitude | DOUBLE PRECISION | metre |
+| baro_altitude, geo_altitude | DOUBLE PRECISION | metres |
 | on_ground | BOOLEAN | |
 | velocity | DOUBLE PRECISION | m/s |
-| true_track | DOUBLE PRECISION | derece |
+| true_track | DOUBLE PRECISION | degrees |
 | vertical_rate | DOUBLE PRECISION | m/s |
 | sensors | TEXT | |
 | squawk | TEXT | |
@@ -43,73 +43,74 @@ olarak referans alinir).
 
 ## 2. `airlines` (dbt seed — `flight_dbt/seeds/airlines.csv`)
 
-OpenFlights airline listesi. Kolonlar: `airline_id, name, alias, iata, icao,
-callsign, country, active`. `\N` ve `""` degerleri null anlamina gelir
-(stg_airlines bunlari temizler).
+OpenFlights airline list. Columns: `airline_id, name, alias, iata, icao,
+callsign, country, active`. `\N` and `""` values mean null (stg_airlines
+cleans these up).
 
 ---
 
-## Staging katmani (`flight_dbt/models/staging/`)
+## Staging layer (`flight_dbt/models/staging/`)
 
 ### `stg_flight_states`
-Kaynak: `raw_flight_states`. Tipleme + fizik-disi deger temizligi yapar
-(~%0.05 satirda gorulen hatali ADS-B okumalari **null'lanir, satir
-silinmez**): `velocity > 400 m/s`, `altitude > 16000 m`,
-`|vertical_rate| > 100 m/s` esiklerinin uzerindeki degerler null olur.
+Source: `raw_flight_states`. Applies typing + physically-implausible value
+cleaning (the ~0.05% of rows with bad ADS-B readings are **nulled out, not
+dropped**): values above the thresholds `velocity > 400 m/s`,
+`altitude > 16000 m`, and `|vertical_rate| > 100 m/s` become null.
 
-| Kolon | Kaynak/Not |
+| Column | Source/Note |
 |---|---|
 | id | not_null, unique |
 | icao24 | not_null |
-| callsign | trim edilmis, bos ise null |
+| callsign | trimmed, null if empty |
 | origin_country | |
 | snapshot_at | `to_timestamp(query_time)`, not_null |
 | position_time | `to_timestamp(time_position)` |
 | last_contact_time | `to_timestamp(last_contact)` |
-| longitude, latitude | -180..180 / -90..90 disinda null |
-| baro_altitude, geo_altitude | esik ustu null |
+| longitude, latitude | null if outside -180..180 / -90..90 |
+| baro_altitude, geo_altitude | null if above threshold |
 | on_ground | |
-| velocity | 0..400 disinda null |
-| true_track | 0..360 disinda null |
-| vertical_rate | \|x\| ≤ 100 disinda null |
-| squawk, spi, position_source, category, ingested_at | oldugu gibi |
+| velocity | null if outside 0..400 |
+| true_track | null if outside 0..360 |
+| vertical_rate | null if \|x\| > 100 |
+| squawk, spi, position_source, category, ingested_at | as-is |
 
 ### `stg_airlines`
-Kaynak: `airlines` seed. `\N`/bos degerleri temizler, `is_active` bool'a
-cevirir, `icao_code` null veya `'N/A'` olan satirlari eler.
+Source: `airlines` seed. Cleans `\N`/empty values, casts `is_active` to bool,
+and drops rows whose `icao_code` is null or `'N/A'`.
 
-Kolonlar: `airline_id, airline_name, iata_code, icao_code, country, is_active`
+Columns: `airline_id, airline_name, iata_code, icao_code, country, is_active`
 
 ---
 
-## Marts katmani (`flight_dbt/models/marts/`) — Metabase'in gorecegi tablolar
+## Marts layer (`flight_dbt/models/marts/`) — the tables Metabase sees
 
 ### `dim_airline`
-Grain: **1 satir / icao_code**. `stg_airlines`'ta ayni icao_code birden
-fazla kayitla geliyorsa (`is_active` oncelikli, sonra `airline_id`) tekiller.
+Grain: **1 row / icao_code**. Deduplicates when the same icao_code arrives with
+multiple records in `stg_airlines` (prioritising `is_active`, then
+`airline_id`).
 
-| Kolon | Test |
+| Column | Test |
 |---|---|
-| icao_code | not_null, unique — join anahtari |
+| icao_code | not_null, unique — join key |
 | airline_name | |
 | iata_code | |
 | country | |
 | is_active | |
 
 ### `fct_flight_positions`
-Grain: **1 satir / ham flight_state gozlemi** (`stg_flight_states` ile
-1:1). `stg_flight_states` ile `dim_airline`'i `left(callsign,3) = icao_code`
-uzerinden left join eder — bu yuzden `airline_icao` ve `airline_name` cogu
-zaman **null** olabilir (callsign yoksa / eslesmiyorsa).
+Grain: **1 row / raw flight_state observation** (1:1 with
+`stg_flight_states`). Left-joins `stg_flight_states` to `dim_airline` on
+`left(callsign,3) = icao_code` — so `airline_icao` and `airline_name` are
+often **null** (no callsign / no match).
 
-| Kolon | Aciklama |
+| Column | Description |
 |---|---|
 | flight_state_id | not_null, unique — `stg_flight_states.id` |
-| snapshot_at | API cagri zamani |
+| snapshot_at | API call time |
 | icao24 | |
 | callsign | |
-| callsign_prefix | `left(callsign,3)` — havayolu tahmini |
-| airline_icao | FK → `dim_airline.icao_code` (nullable, relationships test var) |
+| callsign_prefix | `left(callsign,3)` — airline guess |
+| airline_icao | FK → `dim_airline.icao_code` (nullable, has relationships test) |
 | airline_name | |
 | airline_country | dim_airline.country |
 | registration_country | stg_flight_states.origin_country |
@@ -122,42 +123,42 @@ zaman **null** olabilir (callsign yoksa / eslesmiyorsa).
 | position_time | |
 
 ### `fct_daily_traffic`
-Grain: **1 satir / UTC gun**. Pipeline her 30 dakikada bir calisiyor →
-gunde 48 snapshot beklenir (`snapshots_per_day = 48`). Index: `snapshot_at`.
+Grain: **1 row / UTC day**. The pipeline runs every 30 minutes → 48 snapshots
+expected per day (`snapshots_per_day = 48`). Index: `snapshot_at`.
 
-Onemli tasarim notu: "gunluk farkli ucak/havayolu/ulke sayisi" kasitli
-olarak **yok** — cunku bu metrik snapshot sayisiyla confound olur (cok
-ornekleme = yapay yuksek sayi). Bunun yerine snapshot-bazli max/mean
-degerler kullaniliyor.
+Important design note: "distinct aircraft/airline/country counts per day" are
+deliberately **omitted** — that metric is confounded with the number of
+snapshots (more sampling = artificially higher count). Snapshot-based max/mean
+values are used instead.
 
-| Kolon | Aciklama |
+| Column | Description |
 |---|---|
-| traffic_date | UTC gun (PK gibi düşünülebilir) |
-| snapshots | O gun kac snapshot alindi |
-| coverage_pct | `least(100*snapshots/48, 100)` — gunun ne kadari kapsandi |
-| peak_airborne / peak_at | Havada en cok ucak & o anki snapshot zamani |
-| trough_airborne / trough_at | En az ucak & zamani |
-| mean_airborne | Snapshot basina ortalama havadaki ucak |
-| busiest_airline / busiest_airline_aircraft | Gun icinde ortalamada en yogun havayolu |
-| median_altitude | Snapshot medyanlarinin ortalamasi |
-| median_velocity | Ayni sekilde |
-| climb_ratio | `sum(climbing)/sum(descending)` — >1 gokyuzu doluyor, <1 bosaliyor |
+| traffic_date | UTC day (can be thought of as the PK) |
+| snapshots | How many snapshots were taken that day |
+| coverage_pct | `least(100*snapshots/48, 100)` — how much of the day was covered |
+| peak_airborne / peak_at | Most aircraft airborne & the snapshot time of it |
+| trough_airborne / trough_at | Fewest aircraft & its time |
+| mean_airborne | Average airborne aircraft per snapshot |
+| busiest_airline / busiest_airline_aircraft | Busiest airline on average during the day |
+| median_altitude | Average of per-snapshot medians |
+| median_velocity | Same approach |
+| climb_ratio | `sum(climbing)/sum(descending)` — >1 the sky is filling, <1 emptying |
 
 ---
 
-## Iliskiler / Metabase icin join haritasi
+## Relationships / join map for Metabase
 
 ```
 dim_airline.icao_code  <──  fct_flight_positions.airline_icao   (left join, nullable)
-fct_flight_positions   ──►  fct_daily_traffic  (fct_daily_traffic, fct_flight_positions'tan
-                                                  snapshot_at bazinda agregasyonla turetilir,
-                                                  dogrudan FK degil)
+fct_flight_positions   ──►  fct_daily_traffic  (fct_daily_traffic is derived from
+                                                 fct_flight_positions by aggregating on
+                                                 snapshot_at, not a direct FK)
 stg_flight_states.id   ==   fct_flight_positions.flight_state_id
 ```
 
-- En gunluk/ozet raporlama icin **`fct_daily_traffic`** dogrudan kullanilabilir.
-- Ucak/havayolu bazli detay/harita gorunumu icin **`fct_flight_positions`**
-  (+ gerekiyorsa `dim_airline` join).
-- `airline_icao`/`airline_name` genelde null olabildigi icin Metabase
-  filtrelerinde/agregasyonlarinda bunu goz onunde bulundur (ornegin "bilinmeyen
-  havayolu" kategorisi eklemek gerekebilir).
+- For daily/summary reporting, use **`fct_daily_traffic`** directly.
+- For aircraft/airline-level detail or map views, use **`fct_flight_positions`**
+  (joining `dim_airline` if needed).
+- Since `airline_icao`/`airline_name` are frequently null, account for that in
+  Metabase filters/aggregations (e.g. you may want an "unknown airline"
+  category).
